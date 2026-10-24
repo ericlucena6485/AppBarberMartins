@@ -69,3 +69,46 @@ revoke all on function public.create_booking(text,text,text,numeric,integer,text
 grant execute on function public.public_busy_slots(date,text) to anon,authenticated;
 grant execute on function public.create_booking(text,text,text,numeric,integer,text,date,time) to anon,authenticated;
 -- IMPORTANTE: para produção adicionar proteção anti-bot/rate limiting e painel com login.
+
+
+-- V3: painel administrativo. Execute após o SQL principal.
+-- IMPORTANTE: adicione os UUIDs dos usuários autorizados manualmente.
+create table if not exists public.admin_users (
+ user_id uuid primary key references auth.users(id) on delete cascade,
+ created_at timestamptz not null default now()
+);
+alter table public.admin_users enable row level security;
+revoke all on public.admin_users from anon,authenticated;
+-- Execute após criar o usuário em Authentication > Users:
+-- insert into public.admin_users(user_id) values ('UUID-DO-USUARIO-AQUI');
+
+create or replace function public.admin_list_bookings()
+returns table(id bigint,customer_name text,phone text,service text,price numeric,duration_minutes integer,barber text,slot_day date,slot_time time,status text,created_at timestamptz)
+language plpgsql security definer set search_path=public as $$
+begin
+ if auth.uid() is null or not exists(select 1 from public.admin_users a where a.user_id=auth.uid()) then
+  raise exception 'Acesso administrativo não autorizado';
+ end if;
+ return query select b.id,b.customer_name,b.phone,b.service,b.price,b.duration_minutes,b.barber,b.slot_day,b.slot_time,b.status,b.created_at from public.bookings b order by b.slot_day desc,b.slot_time desc limit 3000;
+end;$$;
+
+-- Permitir concluir somente reservas confirmadas. Cancelamentos liberam horários.
+alter table public.bookings drop constraint if exists bookings_status_check;
+alter table public.bookings add constraint bookings_status_check check(status in ('confirmado','cancelado','concluido'));
+create or replace function public.admin_update_booking(p_id bigint,p_status text)
+returns jsonb language plpgsql security definer set search_path=public as $$
+declare changed integer;
+begin
+ if auth.uid() is null or not exists(select 1 from public.admin_users a where a.user_id=auth.uid()) then
+  raise exception 'Acesso administrativo não autorizado';
+ end if;
+ if p_status not in ('cancelado','concluido') then raise exception 'Status inválido'; end if;
+ update public.bookings b set status=p_status where b.id=p_id and b.status='confirmado';
+ get diagnostics changed=row_count;
+ if changed=0 then raise exception 'Agendamento não encontrado ou já finalizado'; end if;
+ return jsonb_build_object('updated',true);
+end;$$;
+revoke all on function public.admin_list_bookings() from public;
+revoke all on function public.admin_update_booking(bigint,text) from public;
+grant execute on function public.admin_list_bookings() to authenticated;
+grant execute on function public.admin_update_booking(bigint,text) to authenticated;
